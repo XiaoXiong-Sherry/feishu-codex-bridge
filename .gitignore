@@ -1,0 +1,7 @@
+.pixi/
+.env
+env
+*.log
+*.pid
+*.py[cod]
+__pycache__/
