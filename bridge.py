@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import shutil
 import time
 from datetime import datetime
 from pathlib import Path
@@ -8,9 +9,43 @@ from pathlib import Path
 from lark_channel import ChatQueueConfig, FeishuChannel, LogLevel, PolicyConfig, SafetyConfig
 from lark_channel.api.im.v1.model.create_chat_request import CreateChatRequest
 from lark_channel.api.im.v1.model.create_chat_request_body import CreateChatRequestBody
-from openai_codex import ApprovalMode, AsyncCodex, AsyncThread, Sandbox
-from openai_codex.generated.v2_all import AgentMessageThreadItem, ItemCompletedNotification, MessagePhase, ThreadSortKey, ThreadSourceKind, TurnCompletedNotification
+from openai_codex import ApprovalMode, AsyncCodex, AsyncThread, CodexConfig, Sandbox
+from openai_codex.generated.v2_all import AgentMessageThreadItem, ItemCompletedNotification, MessagePhase, SubAgentActivityKind, ThreadSortKey, ThreadSourceKind, TurnCompletedNotification
 from openai_codex.types import ReasoningEffort
+
+
+COMMAND_HINT = """命令速查
+
+会话：/status · /resume [数量] · /resume --all [数量] · /select 编号 · /new
+目录：/pwd · /cd /绝对路径
+设置：/model · /reasoning · /fast [on|off|default]
+管理：/rename 名称 · /group-create [群名] [绝对路径] · /stop
+恢复：/recover-last · /dismiss-last
+删除：/delete [编号]
+
+发送普通文字会交给当前 Codex 执行。"""
+
+
+# Codex 0.152 writes a completed sub-agent activity that SDK 0.147 can otherwise
+# not validate. Treat it as a terminal activity until the SDK publishes the enum.
+if "completed" not in SubAgentActivityKind._value2member_map_:
+    SubAgentActivityKind._value2member_map_["completed"] = SubAgentActivityKind.interrupted
+
+
+def resolve_codex_bin():
+    configured_bin = os.getenv("CODEX_BIN")
+    if configured_bin:
+        return configured_bin
+    local_bin = Path.home() / ".local" / "bin" / "codex"
+    if local_bin.is_file():
+        return str(local_bin)
+    return shutil.which("codex")
+
+
+def new_codex_client():
+    codex_bin = resolve_codex_bin()
+    config = CodexConfig(codex_bin=codex_bin) if codex_bin else None
+    return AsyncCodex(config)
 
 
 class Bridge:
@@ -20,6 +55,8 @@ class Bridge:
         self.allowed_open_id = os.getenv("FEISHU_ALLOWED_OPEN_ID", "").strip()
         self.initial_cwd = str(Path(os.getenv("CODEX_INITIAL_CWD") or Path.home()).expanduser().resolve())
         self.model = os.getenv("CODEX_MODEL") or None
+        self.reasoning_effort = os.getenv("CODEX_REASONING_EFFORT") or None
+        self.service_tier = os.getenv("CODEX_SERVICE_TIER") or None
         config_dir = Path(os.getenv("XDG_CONFIG_HOME") or Path.home() / ".config").expanduser() / "codex-feishu"
         self.state_path = Path(os.getenv("CODEX_STATE_FILE") or config_dir / "state.json")
         self.seen_path = Path(os.getenv("CODEX_SEEN_FILE") or config_dir / "seen.json")
@@ -144,6 +181,7 @@ class Bridge:
         session = self.state.setdefault(chat_id, {"cwd": self.initial_cwd, "thread_id": None, "last_seen_turn_id": None})
         session.setdefault("model", None)
         session.setdefault("reasoning_effort", None)
+        session.setdefault("service_tier", None)
         session.setdefault("inherit_thread_settings", False)
         return session
 
@@ -161,6 +199,26 @@ class Bridge:
             session["reasoning_effort"] = reasoning_effort
             session["inherit_thread_settings"] = False
         self.save_state()
+
+    def set_service_tier(self, chat_id, service_tier):
+        session = self.session(chat_id)
+        thread_id = session["thread_id"]
+        if thread_id:
+            for item in self.state.values():
+                if item.get("thread_id") == thread_id:
+                    item["service_tier"] = service_tier
+        else:
+            session["service_tier"] = service_tier
+        self.save_state()
+
+    def effective_reasoning_effort(self, session):
+        return session.get("reasoning_effort") or self.reasoning_effort
+
+    def effective_service_tier(self, session):
+        service_tier = session.get("service_tier")
+        if service_tier == "off":
+            return None
+        return service_tier or self.service_tier
 
     def inherit_thread_settings(self, chat_id):
         session = self.session(chat_id)
@@ -243,6 +301,7 @@ class Bridge:
             "sandbox": Sandbox.full_access,
             "approval_mode": ApprovalMode.deny_all,
             "model": model,
+            "service_tier": self.effective_service_tier(session),
         }
         if session["thread_id"]:
             thread = await codex.thread_resume(session["thread_id"], **options)
@@ -275,6 +334,9 @@ class Bridge:
             self.pending_deletes.pop(message.chat_id, None)
         task_prompt = text
         session = self.session(message.chat_id)
+        if text in {"/", "/help"}:
+            await self.reply(message, COMMAND_HINT)
+            return
         if text == "/status":
             if message.chat_id in self.active_turns:
                 status = "正在执行任务"
@@ -302,8 +364,9 @@ class Bridge:
                 reasoning_effort = "继承该 Codex session 最后一轮任务设置"
             else:
                 model_name = session.get("model") or self.model or "Codex 默认（飞书未强制指定）"
-                reasoning_effort = session.get("reasoning_effort") or "模型默认"
-            await self.reply(message, f"当前会话状态：{status}\n其他正在执行的会话：{other_count}\n{details}\n当前目录：{session['cwd']}\n当前模型：{model_name}\nReasoning：{reasoning_effort}\n外部客户端占用：发送任务时检查")
+                reasoning_effort = self.effective_reasoning_effort(session) or "模型默认"
+            fast_mode = "开启" if self.effective_service_tier(session) == "fast" else "关闭"
+            await self.reply(message, f"当前会话状态：{status}\n其他正在执行的会话：{other_count}\n{details}\n当前目录：{session['cwd']}\n当前模型：{model_name}\nReasoning：{reasoning_effort}\nFast mode：{fast_mode}\n外部客户端占用：发送任务时检查")
             return
         if text == "/stop":
             if message.chat_id not in self.active_turns:
@@ -358,7 +421,7 @@ class Bridge:
                     await self.reply(message, "该 Codex session 有等待处理的中断任务。请先在对应飞书会话使用 /recover-last 或 /dismiss-last。")
                     return
                 process = await asyncio.create_subprocess_exec(
-                    "codex",
+                    resolve_codex_bin() or "codex",
                     "delete",
                     "--force",
                     thread_id,
@@ -438,9 +501,6 @@ class Bridge:
         if text == "/pwd":
             await self.reply(message, session["cwd"])
             return
-        if text == "/help":
-            await self.reply(message, "/pwd 查看当前目录\n/cd /绝对路径 切换目录\n/resume [1-20] 列出当前目录最近的 Codex session\n/resume --all [1-20] 列出全部目录最近的 Codex session\n/select 编号 进入指定 Codex session\n/new 开启新对话\n/rename 新名称 重命名当前 Codex session\n/model [编号|default] 查看或选择模型\n/reasoning [编号|档位|default] 查看或选择推理强度\n/delete [编号] 永久删除当前或列表中的 Codex session\n/group-create [临时群名] [绝对路径] 创建会话群\n/status 查看当前会话状态\n/stop 停止当前会话任务\n/recover-last 恢复上次中断任务\n/dismiss-last 放弃恢复上次任务")
-            return
         if text == "/model" or text.startswith("/model "):
             parts = text.split()
             if len(parts) > 2:
@@ -460,7 +520,7 @@ class Bridge:
                 else:
                     current_name = current.display_name if current else session.get("model") or self.model or "Codex 默认"
                     default_effort = current.default_reasoning_effort.value if current else "未知"
-                    current_effort = session.get("reasoning_effort") or f"{default_effort}（模型默认）"
+                    current_effort = self.effective_reasoning_effort(session) or f"{default_effort}（模型默认）"
                 rows = [f"{index}. {item.display_name}" for index, item in enumerate(models, 1)]
                 await self.reply(message, f"当前模型：{current_name}\n当前 Reasoning：{current_effort}\n\n可用模型：\n" + "\n".join(rows) + "\n\n选择模型：/model 编号\n恢复默认：/model default")
                 return
@@ -474,7 +534,8 @@ class Bridge:
             if value == "default":
                 self.set_preferences(message.chat_id, None, None)
                 fallback = self.model or "Codex 默认"
-                await self.reply(message, f"已恢复默认模型：{fallback}\nReasoning：模型默认")
+                fallback_effort = self.reasoning_effort or "模型默认"
+                await self.reply(message, f"已恢复默认模型：{fallback}\nReasoning：{fallback_effort}")
                 return
             if value.isdigit():
                 cached = self.model_results.get(message.chat_id)
@@ -494,7 +555,8 @@ class Bridge:
                 return
             self.set_preferences(message.chat_id, selected.model, None)
             efforts = "、".join(option.reasoning_effort.value for option in selected.supported_reasoning_efforts)
-            await self.reply(message, f"已选择模型：{selected.display_name}\nReasoning：{selected.default_reasoning_effort.value}（模型默认）\n可选档位：{efforts}\n使用 /reasoning 选择推理强度。")
+            selected_effort = self.reasoning_effort or f"{selected.default_reasoning_effort.value}（模型默认）"
+            await self.reply(message, f"已选择模型：{selected.display_name}\nReasoning：{selected_effort}\n可选档位：{efforts}\n使用 /reasoning 选择推理强度。")
             return
         if text == "/reasoning" or text.startswith("/reasoning "):
             parts = text.split()
@@ -521,9 +583,9 @@ class Bridge:
                 return
             efforts = [option.reasoning_effort.value for option in current.supported_reasoning_efforts]
             if len(parts) == 1:
-                current_effort = session.get("reasoning_effort") or f"{current.default_reasoning_effort.value}（模型默认）"
+                current_effort = self.effective_reasoning_effort(session) or f"{current.default_reasoning_effort.value}（模型默认）"
                 rows = [f"{index}. {effort}" for index, effort in enumerate(efforts, 1)]
-                await self.reply(message, f"当前模型：{current.display_name}\n当前 Reasoning：{current_effort}\n\n可选档位：\n" + "\n".join(rows) + "\n\n选择档位：/reasoning 编号 或 /reasoning 档位\n恢复模型默认：/reasoning default")
+                await self.reply(message, f"当前模型：{current.display_name}\n当前 Reasoning：{current_effort}\n\n可选档位：\n" + "\n".join(rows) + "\n\n选择档位：/reasoning 编号 或 /reasoning 档位\n恢复 Bridge 默认：/reasoning default")
                 return
             value = parts[1]
             if value == "default":
@@ -540,8 +602,28 @@ class Bridge:
                 await self.reply(message, f"当前模型不支持 Reasoning 档位：{value}\n可选档位：{'、'.join(efforts)}")
                 return
             self.set_preferences(message.chat_id, session.get("model"), selected_effort)
-            shown_effort = selected_effort or f"{current.default_reasoning_effort.value}（模型默认）"
+            shown_effort = selected_effort or self.reasoning_effort or f"{current.default_reasoning_effort.value}（模型默认）"
             await self.reply(message, f"已设置 Reasoning：{shown_effort}\n当前模型：{current.display_name}")
+            return
+        if text == "/fast" or text.startswith("/fast "):
+            parts = text.split()
+            if len(parts) > 2 or (len(parts) == 2 and parts[1] not in {"on", "off", "default"}):
+                await self.reply(message, "格式：/fast [on|off|default]")
+                return
+            if len(parts) == 1:
+                fast_mode = "开启" if self.effective_service_tier(session) == "fast" else "关闭"
+                await self.reply(message, f"Fast mode：{fast_mode}\n开启：/fast on\n关闭：/fast off\n恢复 Bridge 默认：/fast default")
+                return
+            if message.chat_id in self.active_turns:
+                await self.reply(message, "当前会话正在执行任务，任务完成后才能切换 Fast mode。")
+                return
+            if self.active_chat_for_thread(session["thread_id"], message.chat_id):
+                await self.reply(message, "该 Codex session 正在另一个飞书会话中执行任务，任务完成后才能切换 Fast mode。")
+                return
+            service_tier = "fast" if parts[1] == "on" else "off" if parts[1] == "off" else None
+            self.set_service_tier(message.chat_id, service_tier)
+            fast_mode = "开启" if self.effective_service_tier(session) == "fast" else "关闭"
+            await self.reply(message, f"Fast mode 已{fast_mode}。")
             return
         if text == "/rename" or text.startswith("/rename "):
             name = text[len("/rename"):].strip()
@@ -556,7 +638,7 @@ class Bridge:
                 return
             created = not session["thread_id"]
             try:
-                async with AsyncCodex() as codex:
+                async with new_codex_client() as codex:
                     thread = await self.get_thread(message.chat_id, codex)
                     await thread.set_name(name)
             except Exception as error:
@@ -645,7 +727,7 @@ class Bridge:
                 return
             thread = threads[index - 1]
             try:
-                async with AsyncCodex() as codex:
+                async with new_codex_client() as codex:
                     thread_data = (await AsyncThread(codex, thread.id).read(include_turns=True)).thread
             except Exception as error:
                 await self.reply(message, f"读取 Codex session 失败：{error}")
@@ -653,7 +735,10 @@ class Bridge:
             session["cwd"] = thread.cwd.root
             session["thread_id"] = thread.id
             session["last_seen_turn_id"] = thread_data.turns[-1].id if thread_data.turns else None
-            self.inherit_thread_settings(message.chat_id)
+            if self.model or self.reasoning_effort:
+                self.set_preferences(message.chat_id, None, None)
+            else:
+                self.inherit_thread_settings(message.chat_id)
             title = thread.name or thread.preview or thread.id[:8]
             notice = ""
             if self.active_chat_for_thread(thread.id, message.chat_id):
@@ -686,7 +771,7 @@ class Bridge:
             last_seen_turn_id = None
             if session["thread_id"]:
                 try:
-                    async with AsyncCodex() as codex:
+                    async with new_codex_client() as codex:
                         thread_data = (await AsyncThread(codex, session["thread_id"]).read(include_turns=True)).thread
                     formal_name = thread_data.name or ""
                     last_seen_turn_id = thread_data.turns[-1].id if thread_data.turns else None
@@ -714,6 +799,7 @@ class Bridge:
                 "last_seen_turn_id": last_seen_turn_id,
                 "model": session.get("model"),
                 "reasoning_effort": session.get("reasoning_effort"),
+                "service_tier": session.get("service_tier"),
                 "inherit_thread_settings": session.get("inherit_thread_settings"),
             }
             self.save_state()
@@ -761,14 +847,14 @@ class Bridge:
             return
         self.active_turns[message.chat_id] = None
         try:
-            async with AsyncCodex() as codex:
+            async with new_codex_client() as codex:
                 external_update = False
                 if session["thread_id"]:
                     thread_data = (await AsyncThread(codex, session["thread_id"]).read(include_turns=True)).thread
                     latest_turn_id = thread_data.turns[-1].id if thread_data.turns else None
                     last_seen_turn_id = session.get("last_seen_turn_id")
                     external_update = last_seen_turn_id is not None and latest_turn_id != last_seen_turn_id
-                    if external_update:
+                    if external_update and not (self.model or self.reasoning_effort):
                         self.inherit_thread_settings(message.chat_id)
                 thread = await self.get_thread(message.chat_id, codex)
                 notice = "检测到该 Codex session 在本飞书会话上次操作后有新的对话内容，可能来自 Workspace、CLI 或另一个飞书会话。\n本次任务将基于最新上下文继续。\n\n" if external_update else ""
@@ -781,15 +867,17 @@ class Bridge:
                     "cwd": session["cwd"],
                     "prompt": task_prompt,
                     "model": None if session.get("inherit_thread_settings") else session.get("model") or self.model,
-                    "reasoning_effort": None if session.get("inherit_thread_settings") else session.get("reasoning_effort"),
+                    "reasoning_effort": None if session.get("inherit_thread_settings") else self.effective_reasoning_effort(session),
+                    "service_tier": self.effective_service_tier(session),
                     "started_at": int(time.time()),
                     "delivered": False,
                 }
                 self.last_tasks[message.chat_id] = task
                 self.save_last_tasks()
                 model = None if session.get("inherit_thread_settings") else session.get("model") or self.model
-                effort = ReasoningEffort(session["reasoning_effort"]) if not session.get("inherit_thread_settings") and session.get("reasoning_effort") else None
-                turn = await thread.turn(text, model=model, effort=effort)
+                reasoning_effort = None if session.get("inherit_thread_settings") else self.effective_reasoning_effort(session)
+                effort = ReasoningEffort(reasoning_effort) if reasoning_effort else None
+                turn = await thread.turn(text, model=model, effort=effort, service_tier=self.effective_service_tier(session))
                 self.active_turns[message.chat_id] = turn
                 session["last_seen_turn_id"] = turn.id
                 self.save_state()
@@ -842,7 +930,7 @@ async def main():
     )
     channel = FeishuChannel(app_id=app_id, app_secret=app_secret, policy=policy, safety=SafetyConfig(chat_queue=ChatQueueConfig(enabled=False), stale_message_window_ms=30_000), log_level=LogLevel.WARNING)
     os.environ.pop("FEISHU_APP_SECRET", None)
-    async with AsyncCodex() as codex:
+    async with new_codex_client() as codex:
         bridge = Bridge(codex, channel)
         channel.on("message", bridge.on_message)
         channel.on("reconnected", bridge.on_reconnected)

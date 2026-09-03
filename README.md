@@ -13,7 +13,7 @@
 | 开启新对话 | `/new` |
 | 恢复历史 session | `/resume`、`/resume --all`、`/select 编号` |
 | 重命名 session | `/rename 名称` |
-| 选择模型和推理强度 | `/model`、`/reasoning` |
+| 选择模型、推理强度和 Fast mode | `/model`、`/reasoning`、`/fast` |
 | 查看或停止任务 | `/status`、`/stop` |
 | 创建独立会话群 | `/group-create` |
 | 永久删除 session | `/delete`、`/delete 编号` |
@@ -111,12 +111,14 @@ FEISHU_APP_ID=你的_App_ID
 FEISHU_APP_SECRET=你的_App_Secret
 FEISHU_ALLOWED_OPEN_ID=
 CODEX_INITIAL_CWD=
-CODEX_MODEL=
+CODEX_MODEL=gpt-5.6-sol
+CODEX_REASONING_EFFORT=high
+CODEX_SERVICE_TIER=fast
 ```
 
 - `FEISHU_ALLOWED_OPEN_ID` 第一次保持为空，下一步获取。
 - `CODEX_INITIAL_CWD` 留空时使用当前用户主目录，也可以填写其他绝对路径。
-- `CODEX_MODEL` 留空时不强制指定模型。
+- `CODEX_MODEL`、`CODEX_REASONING_EFFORT` 和 `CODEX_SERVICE_TIER` 分别设置 Bridge 的默认模型、推理强度和服务档位；任一项留空时不强制指定对应设置。
 - 等号两边不要添加空格。
 
 ### 2.5 第一次启动并获取 Open ID
@@ -197,6 +199,7 @@ pixi run status
 | `/rename 新名称` | 重命名当前 Codex session |
 | `/model [编号|default]` | 查看、选择或恢复默认模型 |
 | `/reasoning [编号|档位|default]` | 查看或选择推理强度 |
+| `/fast [on|off|default]` | 查看、开启、关闭或恢复默认 Fast mode |
 | `/status` | 查看当前飞书会话和 session 状态 |
 | `/stop` | 停止当前飞书会话正在执行的任务 |
 | `/group-create [临时群名] [绝对路径]` | 创建 Codex 会话群 |
@@ -300,11 +303,22 @@ pixi run status
 /model default
 ```
 
-选择模型后，Reasoning 会先恢复为该模型的默认档位。显式设置会用于当前飞书会话后续发起的任务；同一个 session 绑定的其他飞书会话也会看到该设置。
+选择模型后，Reasoning 会恢复为 Bridge 默认值；未配置 `CODEX_REASONING_EFFORT` 时才使用模型默认档位。显式设置会用于当前飞书会话后续发起的任务；同一个 session 绑定的其他飞书会话也会看到该设置。
 
-`/select` 进入历史 session 后，Bridge 默认继承该 session 最后一轮任务使用的模型和 Reasoning，不用旧的飞书设置覆盖它。最后一轮可能来自 Workspace、CLI 或飞书。由于只读接口不返回精确值，`/status` 可能显示“继承该 Codex session 最后一轮任务设置”。
+`/select` 进入历史 session 后，如果没有配置 Bridge 默认模型或 Reasoning，Bridge 会继承该 session 最后一轮任务使用的设置，不用旧的飞书设置覆盖它。最后一轮可能来自 Workspace、CLI 或飞书。由于只读接口不返回精确值，`/status` 可能显示“继承该 Codex session 最后一轮任务设置”。
 
 这些设置只影响飞书后续发起的任务，不修改 Workspace 或 CLI 的全局模型配置。任务执行期间不能切换模型或 Reasoning。
+
+Fast mode 使用低延迟服务档位。查看或切换：
+
+```text
+/fast
+/fast on
+/fast off
+/fast default
+```
+
+`/fast default` 恢复 `CODEX_SERVICE_TIER` 设置；同一个 session 绑定的其他飞书会话会共享显式开关。任务执行期间不能切换。
 
 ### 3.4 状态、进度和停止
 
@@ -317,7 +331,7 @@ pixi run status
 - 当前飞书会话是否空闲或正在执行任务。
 - 其他正在执行的飞书会话数量。
 - 当前目录、session 名称、来源和完整 ID。
-- 当前模型和 Reasoning 设置。
+- 当前模型、Reasoning 和 Fast mode 设置。
 
 “空闲”只表示飞书当前没有执行任务，不保证 Workspace、CLI 或其他客户端已经释放同一个 session。真正发送普通任务时，Bridge 才会取得执行权。
 
@@ -438,9 +452,9 @@ Codex 会先检查文件、进程和实际状态，再决定如何继续。确�
 - `/new` 和 `/cd` 只进入“等待下一条任务”的状态，不立即创建。
 - `/rename` 在没有 session 时会创建一个空 session 并命名。
 - `/group-create` 在没有 session 时只创建飞书群；新群的第一条普通任务才创建 session。
-- `/pwd`、`/status`、`/resume`、`/model`、`/reasoning` 和 `/help` 不会创建 session。
+- `/pwd`、`/status`、`/resume`、`/model`、`/reasoning`、`/fast` 和 `/help` 不会创建 session。
 
-每个飞书私聊和群聊分别保存自己的当前目录、Session ID、模型设置和最后看到的 turn ID。Bridge 重启后会从本地状态文件恢复这些绑定。
+每个飞书私聊和群聊分别保存自己的当前目录、Session ID、模型、Reasoning、Fast mode 设置和最后看到的 turn ID。Bridge 重启后会从本地状态文件恢复这些绑定。
 
 ### 4.2 飞书与本地 Codex 的上下文
 
@@ -508,7 +522,7 @@ Bridge 使用 `nohup + setsid` 后台运行，关闭终端不会停止；Workspa
 
 | 路径 | 用途 |
 |---|---|
-| `~/.config/codex-feishu/env` | App ID、App Secret、Open ID 和默认目录 |
+| `~/.config/codex-feishu/env` | App ID、App Secret、Open ID、默认目录和 Codex 默认设置 |
 | `~/.config/codex-feishu/state.json` | 各飞书会话的目录和 session 绑定 |
 | `~/.config/codex-feishu/seen.json` | 最近处理的飞书消息 ID |
 | `~/.config/codex-feishu/last-task.json` | 最后任务、状态和未送达结果 |
