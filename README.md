@@ -39,6 +39,15 @@
 
 本文假设仓库位于 `~/feishu-codex-bridge`。如果放在其他位置，请替换命令中的项目路径；`start.sh` 会自动识别自己所在的目录。
 
+macOS（Apple Silicon）可以直接运行交互式向导。它会安装锁定依赖、引导创建飞书应用和凭证、获取 Open ID，并启动 Bridge：
+
+```bash
+cd ~/feishu-codex-bridge
+./setup-macos.sh
+```
+
+Linux 或希望手动配置时，继续按以下步骤操作。
+
 ### 2.1 准备 Codex 和 Pixi
 
 先确认 Workspace 中的 Codex 已经登录：
