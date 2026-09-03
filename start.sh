@@ -15,15 +15,28 @@ get_pid() {
     local pid cmdline
     [[ -f "$pid_file" ]] || return 1
     pid=$(<"$pid_file")
-    [[ "$pid" =~ ^[0-9]+$ && -r "/proc/$pid/cmdline" ]] || return 1
-    cmdline=$(tr '\0' ' ' < "/proc/$pid/cmdline")
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+    kill -0 "$pid" 2>/dev/null || return 1
+    if [[ -r "/proc/$pid/cmdline" ]]; then
+        cmdline=$(tr '\0' ' ' < "/proc/$pid/cmdline")
+    else
+        cmdline=$(ps -p "$pid" -o command= 2>/dev/null) || return 1
+    fi
     [[ "$cmdline" == *"$bridge"* ]] || return 1
     printf '%s\n' "$pid"
 }
 
+file_mode() {
+    if stat -c '%a' "$1" >/dev/null 2>&1; then
+        stat -c '%a' "$1"
+    else
+        stat -f '%Lp' "$1"
+    fi
+}
+
 load_env() {
     [[ -f "$env_file" ]] || { echo "凭证文件不存在：$env_file" >&2; exit 1; }
-    [[ $(stat -c '%a' "$env_file") == 600 ]] || { echo "凭证文件权限必须是 600" >&2; exit 1; }
+    [[ $(file_mode "$env_file") == 600 ]] || { echo "凭证文件权限必须是 600" >&2; exit 1; }
     set -a
     source "$env_file"
     set +a
@@ -47,7 +60,11 @@ start() {
     fi
     touch "$log_file"
     chmod 600 "$log_file"
-    nohup setsid "$python_bin" -u "$bridge" </dev/null >>"$log_file" 2>&1 &
+    if command -v setsid >/dev/null 2>&1; then
+        nohup setsid "$python_bin" -u "$bridge" </dev/null >>"$log_file" 2>&1 &
+    else
+        nohup "$python_bin" -u "$bridge" </dev/null >>"$log_file" 2>&1 &
+    fi
     pid=$!
     printf '%s\n' "$pid" > "$pid_file"
     sleep 2
