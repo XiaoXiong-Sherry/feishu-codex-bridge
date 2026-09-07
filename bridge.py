@@ -235,6 +235,50 @@ class Bridge:
             raise RuntimeError(f"turn failed with status {completed_turn.status.value}")
         return completed_turn.status, final_response or fallback_response
 
+    async def await_turn_handle(self, chat_id, timeout=15.0):
+        """Wait out the gap between a chat claiming its turn slot and the turn existing.
+
+        Returns None if the slot empties first or the turn never shows up.
+        """
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if chat_id not in self.active_turns:
+                return None
+            turn = self.active_turns[chat_id]
+            if turn is not None:
+                return turn
+            await asyncio.sleep(0.1)
+        return None
+
+    async def await_free_turn_slot(self, chat_id, timeout=15.0):
+        deadline = time.monotonic() + timeout
+        while chat_id in self.active_turns and time.monotonic() < deadline:
+            await asyncio.sleep(0.1)
+        return chat_id not in self.active_turns
+
+    async def steer_active_turn(self, message, text, task_prompt):
+        """Merge a message into this chat's running turn.
+
+        Codex delivers it once the turn finishes the tool call it is on, so it
+        lands mid-task rather than after it. Returns False when the turn has
+        already ended and the caller should start a new turn for the message.
+        """
+        turn = await self.await_turn_handle(message.chat_id)
+        if turn is None:
+            return False
+        try:
+            await turn.steer(text)
+        except Exception as error:
+            # turn/steer only accepts the currently active turn id.
+            print(f"送入当前任务失败，改为开启新一轮：{error}", flush=True)
+            return False
+        task = self.last_tasks.get(message.chat_id)
+        if task:
+            task["prompt"] = f"{task['prompt']}\n\n[执行中追加] {task_prompt}"
+            self.save_last_tasks()
+        await self.reply(message, "已送入当前任务。Codex 会在完成手上这一步后读到它，不会另起一个任务。")
+        return True
+
     async def get_thread(self, chat_id, codex):
         session = self.session(chat_id)
         model = None if session.get("inherit_thread_settings") else session.get("model") or self.model
@@ -724,8 +768,8 @@ class Bridge:
             await self.channel.send(chat_id, {"text": group_message})
             await self.reply(message, f"已创建群：Codex - {group_name}\n当前目录：{cwd}")
             return
-        if message.chat_id in self.active_turns:
-            await self.reply(message, "当前会话已有 Codex 任务正在执行，请完成后重新发送。")
+        if message.chat_id in self.active_turns and (text == "/new" or text.startswith("/cd ")):
+            await self.reply(message, "当前会话已有 Codex 任务正在执行，请等它结束后再切换目录或开启新对话。")
             return
         if text.startswith("/cd "):
             cwd = Path(text[4:].strip()).expanduser().resolve()
@@ -756,6 +800,12 @@ class Bridge:
             self.save_state()
             await self.reply(message, f"已开启新对话。\n当前目录：{session['cwd']}")
             return
+        if message.chat_id in self.active_turns:
+            if await self.steer_active_turn(message, text, task_prompt):
+                return
+            if not await self.await_free_turn_slot(message.chat_id):
+                await self.reply(message, "当前会话的任务仍在执行，这条消息没有送达，请稍后重新发送。")
+                return
         if self.active_chat_for_thread(session["thread_id"], message.chat_id):
             await self.reply(message, "该 Codex session 正在另一个飞书会话中执行任务，请等待任务完成后再试。")
             return
