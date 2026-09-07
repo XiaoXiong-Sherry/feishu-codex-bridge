@@ -500,7 +500,7 @@ pixi run status
 
 `pixi run status` 显示进程和最近日志。进程存在不等于飞书长连接一定健康，还应结合飞书上线通知和错误日志判断。
 
-Bridge 使用 `nohup + setsid` 后台运行，关闭终端不会停止；Workspace、容器或服务器重启后需要手动执行 `pixi run start`。
+Bridge 使用 `nohup` 后台运行，并始终脱离启动它的终端会话：有 `setsid` 时用 `setsid`，没有时（例如 macOS）由 Python 自己调用 `os.setsid`。关闭终端不会停止；Workspace、容器或服务器重启后需要手动执行 `pixi run start`。
 
 ### 5.2 配置、状态和日志
 
