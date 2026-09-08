@@ -13,7 +13,7 @@ from lark_channel import ChatQueueConfig, FeishuChannel, LogLevel, PolicyConfig,
 from lark_channel.api.im.v1.model.create_chat_request import CreateChatRequest
 from lark_channel.api.im.v1.model.create_chat_request_body import CreateChatRequestBody
 from openai_codex import ApprovalMode, AsyncCodex, AsyncThread, Sandbox
-from openai_codex.generated.v2_all import AgentMessageThreadItem, ItemCompletedNotification, MessagePhase, ThreadSortKey, ThreadSourceKind, TurnCompletedNotification
+from openai_codex.generated.v2_all import AgentMessageThreadItem, ConfigReadResponse, ItemCompletedNotification, MessagePhase, ThreadSortKey, ThreadSourceKind, TurnCompletedNotification
 from openai_codex.types import ReasoningEffort
 
 
@@ -149,9 +149,11 @@ class Bridge:
         session.setdefault("model", None)
         session.setdefault("reasoning_effort", None)
         session.setdefault("fast_mode", "auto")
+        session.setdefault("service_tier", None)
         session.setdefault("inherit_thread_settings", False)
-        if session["fast_mode"] == "auto" and session["thread_id"] and session["inherit_thread_settings"]:
-            session["fast_mode"] = "inherit"
+        if session["fast_mode"] == "inherit":
+            session["fast_mode"] = "auto"
+            session["service_tier"] = None
         return session
 
     def set_preferences(self, chat_id, model, reasoning_effort):
@@ -176,8 +178,10 @@ class Bridge:
             for item in self.state.values():
                 if item.get("thread_id") == thread_id:
                     item["fast_mode"] = fast_mode
+                    item["service_tier"] = None
         else:
             session["fast_mode"] = fast_mode
+            session["service_tier"] = None
         self.save_state()
 
     def inherit_thread_settings(self, chat_id):
@@ -188,12 +192,10 @@ class Bridge:
                 if item.get("thread_id") == thread_id:
                     item["model"] = None
                     item["reasoning_effort"] = None
-                    item["fast_mode"] = "inherit"
                     item["inherit_thread_settings"] = True
         else:
             session["model"] = None
             session["reasoning_effort"] = None
-            session["fast_mode"] = "auto"
             session["inherit_thread_settings"] = False
         self.save_state()
 
@@ -218,10 +220,8 @@ class Bridge:
 
     async def effective_service_tier(self, session):
         fast_mode = session.get("fast_mode", "auto")
-        if fast_mode == "inherit":
-            return None
         if fast_mode == "auto":
-            return "default"
+            return session.get("service_tier")
         models = await self.available_models()
         current = self.selected_model(session, models)
         if not current:
@@ -239,9 +239,10 @@ class Bridge:
             return "开启（飞书明确设置）"
         if fast_mode == "off":
             return "关闭（飞书明确设置）"
-        if fast_mode == "inherit":
-            return "沿用该 Codex session 的最新设置（具体开关无法读取）"
-        return "关闭（Codex 默认）" if session["thread_id"] else "未设置"
+        if session.get("service_tier"):
+            state = "开启" if session["service_tier"] == "fast" else "关闭"
+            return f"{state}（Codex 本地默认）"
+        return "跟随 Codex 本地默认设置"
 
     def active_chat_for_thread(self, thread_id, exclude_chat_id=None):
         if not thread_id:
@@ -292,6 +293,21 @@ class Bridge:
 
     async def get_thread(self, chat_id, codex):
         session = self.session(chat_id)
+        if not session["thread_id"]:
+            defaults = (
+                await codex._client.request(
+                    "config/read",
+                    {"cwd": session["cwd"], "includeLayers": False},
+                    response_model=ConfigReadResponse,
+                )
+            ).config
+            if not session.get("model") and not self.model:
+                session["model"] = defaults.model
+                if not session.get("reasoning_effort") and defaults.model_reasoning_effort:
+                    session["reasoning_effort"] = defaults.model_reasoning_effort.value
+            if session.get("fast_mode", "auto") == "auto":
+                session["service_tier"] = defaults.service_tier
+            self.save_state()
         model = None if session.get("inherit_thread_settings") else session.get("model") or self.model
         service_tier = await self.effective_service_tier(session)
         options = {
@@ -357,6 +373,10 @@ class Bridge:
             if session.get("inherit_thread_settings"):
                 model_name = "继承该 Codex session 最后一轮任务设置"
                 reasoning_effort = "继承该 Codex session 最后一轮任务设置"
+            elif not session.get("model") and not self.model:
+                default_text = "由当前 Codex session 决定（飞书未覆盖）" if session["thread_id"] else "跟随 Codex 本地默认设置"
+                model_name = default_text
+                reasoning_effort = session.get("reasoning_effort") or default_text
             else:
                 model_name = session.get("model") or self.model or "Codex 默认（飞书未强制指定）"
                 reasoning_effort = session.get("reasoning_effort") or "模型默认"
@@ -433,9 +453,11 @@ class Bridge:
                     if item.get("thread_id") == thread_id:
                         item["thread_id"] = None
                         item["last_seen_turn_id"] = None
+                        item["model"] = None
+                        item["reasoning_effort"] = None
                         item["fast_mode"] = "auto"
-                        if item.get("inherit_thread_settings"):
-                            item["inherit_thread_settings"] = False
+                        item["service_tier"] = None
+                        item["inherit_thread_settings"] = False
                         bound_count += 1
                 self.save_state()
                 self.feishu_thread_ids.discard(thread_id)
@@ -515,6 +537,10 @@ class Bridge:
                 if session.get("inherit_thread_settings"):
                     current_name = "继承该 Codex session 最后一轮任务设置"
                     current_effort = "继承该 Codex session 最后一轮任务设置"
+                elif not session.get("model") and not self.model:
+                    default_text = "由当前 Codex session 决定（飞书未覆盖）" if session["thread_id"] else "跟随 Codex 本地默认设置"
+                    current_name = default_text
+                    current_effort = session.get("reasoning_effort") or default_text
                 else:
                     current_name = current.display_name if current else session.get("model") or self.model or "Codex 默认"
                     default_effort = current.default_reasoning_effort.value if current else "未知"
@@ -750,9 +776,14 @@ class Bridge:
             except Exception as error:
                 await self.reply(message, f"读取 Codex session 失败：{error}")
                 return
+            fast_session = next((item for item in self.state.values() if item.get("thread_id") == thread.id), None)
             session["cwd"] = thread.cwd.root
             session["thread_id"] = thread.id
             session["last_seen_turn_id"] = thread_data.turns[-1].id if thread_data.turns else None
+            session["fast_mode"] = fast_session.get("fast_mode", "auto") if fast_session else "auto"
+            session["service_tier"] = fast_session.get("service_tier") if fast_session and session["fast_mode"] != "inherit" else None
+            if session["fast_mode"] == "inherit":
+                session["fast_mode"] = "auto"
             self.inherit_thread_settings(message.chat_id)
             title = thread.name or thread.preview or thread.id[:8]
             notice = ""
@@ -815,6 +846,7 @@ class Bridge:
                 "model": session.get("model"),
                 "reasoning_effort": session.get("reasoning_effort"),
                 "fast_mode": session.get("fast_mode", "auto"),
+                "service_tier": session.get("service_tier"),
                 "inherit_thread_settings": session.get("inherit_thread_settings"),
             }
             self.save_state()
@@ -836,10 +868,10 @@ class Bridge:
             session["cwd"] = str(cwd)
             session["thread_id"] = None
             session["last_seen_turn_id"] = None
+            session["model"] = None
+            session["reasoning_effort"] = None
             session["fast_mode"] = "auto"
-            if session.get("inherit_thread_settings"):
-                session["model"] = None
-                session["reasoning_effort"] = None
+            session["service_tier"] = None
             session["inherit_thread_settings"] = False
             self.resume_results.pop(message.chat_id, None)
             self.pending_deletes.pop(message.chat_id, None)
@@ -849,10 +881,10 @@ class Bridge:
         if text == "/new":
             session["thread_id"] = None
             session["last_seen_turn_id"] = None
+            session["model"] = None
+            session["reasoning_effort"] = None
             session["fast_mode"] = "auto"
-            if session.get("inherit_thread_settings"):
-                session["model"] = None
-                session["reasoning_effort"] = None
+            session["service_tier"] = None
             session["inherit_thread_settings"] = False
             self.resume_results.pop(message.chat_id, None)
             self.pending_deletes.pop(message.chat_id, None)

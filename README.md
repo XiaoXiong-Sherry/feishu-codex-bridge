@@ -195,6 +195,8 @@ pixi run status
 - `/cd` 和 `/new` 都不会立即创建 session；下一条普通任务才会创建。
 - `/cd` 后也可以先用 `/resume` 查找该目录的历史 session。
 - 原 session 不会被删除，以后仍可恢复。
+- 创建新 session 时，Bridge 会读取当前目录的有效 Codex 配置，并保存当时的模型、Reasoning 和 Fast 作为初始设置。
+- 两个命令都会清除当前飞书会话显式设置的模型、Reasoning 和 Fast。
 - 两个命令都会清除当前飞书会话保存的旧列表编号和待确认删除。
 
 ### 3.2 恢复和重命名 session
@@ -265,18 +267,25 @@ pixi run status
 
 - `on`：飞书后续任务使用 Fast 服务档位。
 - `off`：飞书后续任务使用普通服务档位。
-- 没有 session 时显示“未设置”。
-- 新 session 默认使用普通档位，显示“关闭（Codex 默认）”。
+- 没有 session 时显示“跟随 Codex 本地默认设置”。
 - 当前模型不支持 Fast 时不会开启。
 - 任务执行期间不能切换 Fast mode。
 
-模型、Reasoning 和 Fast 遵循同一组跨客户端规则：
+模型和 Reasoning 的跨客户端规则：
 
-- 飞书中的明确设置用于 Bridge 后续发起的任务，不修改 Workspace 或 CLI 的全局配置。
-- 同一个 session 绑定的多个飞书会话共享飞书明确设置。
-- `/select` 进入历史 session 时，Bridge 沿用该 session 最后一轮任务的设置，不用旧飞书设置覆盖。
-- Workspace、CLI 或另一个飞书会话完成新任务后，当前飞书会话会在下一条普通任务前检测到外部更新，并改为沿用最新 session 设置。
-- Codex 的只读 session 接口不返回精确的历史模型、Reasoning 和 Fast 开关，因此 `/status` 可能显示“沿用该 Codex session 的最新设置”，不能显示具体值。
+- 飞书明确设置并完成一轮任务后，会成为该 session 后续任务的默认值，但不修改 Workspace 或 CLI 的全局配置。
+- 模型和 Reasoning 以该 session 最后一轮任务使用的设置为准，不论任务来自 Workspace、CLI 还是飞书。
+- `/select` 进入历史 session 时，会沿用该 session 最后一轮任务的模型和 Reasoning。
+- Workspace、CLI 或另一个飞书会话完成新任务后，飞书会在下一条普通任务前提示外部更新，并沿用最新 session 设置。
+- 只读 session 接口不返回精确值，因此 `/status` 可能只显示“继承该 Codex session 最后一轮任务设置”。
+
+Fast 是 Bridge 独立保存的请求设置：
+
+- `/fast` 不随 session 跨客户端同步；Workspace、CLI 和飞书各自使用自己的 Fast 设置。
+- 同一 session 绑定的多个飞书会话共享 Bridge 保存的 Fast 设置。
+- Workspace 或 CLI 更新 session 后，飞书仍保留 Bridge 中原来的 Fast 设置。
+- Bridge 只在仍有飞书会话绑定该 session 时保留 Fast 设置；全部解绑后，再次 `/select` 会使用 Codex 本地默认设置。
+- `/select` 时，如果该 session 已绑定其他飞书会话，则共享其 Fast 设置；否则跟随当前 Codex 本地默认配置。
 
 ### 3.4 状态、进度和停止
 
@@ -394,6 +403,7 @@ Bridge 启动和飞书重连后会私聊允许使用者：
 - Bridge 上线通知不会创建 session。
 - 没有绑定时，第一条普通任务会创建 session。
 - `/new` 和 `/cd` 只等待下一条普通任务，不立即创建。
+- `/new`、`/cd` 或新群创建的 session 默认跟随 Codex 本地当前设置。
 - `/rename` 可以创建一个有名称的空 session。
 - `/group-create` 在没有 session 时只创建飞书群；新群的第一条普通任务才创建 session。
 - `/pwd`、`/status`、`/resume`、`/model`、`/reasoning`、`/fast` 和 `/help` 不会创建 session。
@@ -558,7 +568,7 @@ pixi run status
 - 日志每次启动时轮转，只保留当前和上一次启动日志。
 - 同一个 session 不能同时被 Workspace、CLI 和飞书占用。
 - Codex turn 结束后，Bridge 无法继续监视它独立启动的后台进程。
-- Codex 的只读 session 接口无法返回历史任务使用的精确模型、Reasoning 和 Fast 状态。
+- Codex 的只读 session 接口无法返回最后一轮任务的精确设置；模型和 Reasoning 可以由 session 继续继承，Fast 无法据此跨客户端同步。
 
 ## 8. 快速验收
 
