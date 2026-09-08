@@ -5,6 +5,10 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+cert_file = Path(__file__).resolve().parent / ".pixi/envs/default/ssl/cert.pem"
+if cert_file.is_file():
+    os.environ.setdefault("SSL_CERT_FILE", str(cert_file))
+
 from lark_channel import ChatQueueConfig, FeishuChannel, LogLevel, PolicyConfig, SafetyConfig
 from lark_channel.api.im.v1.model.create_chat_request import CreateChatRequest
 from lark_channel.api.im.v1.model.create_chat_request_body import CreateChatRequestBody
@@ -144,7 +148,10 @@ class Bridge:
         session = self.state.setdefault(chat_id, {"cwd": self.initial_cwd, "thread_id": None, "last_seen_turn_id": None})
         session.setdefault("model", None)
         session.setdefault("reasoning_effort", None)
+        session.setdefault("fast_mode", "auto")
         session.setdefault("inherit_thread_settings", False)
+        if session["fast_mode"] == "auto" and session["thread_id"] and session["inherit_thread_settings"]:
+            session["fast_mode"] = "inherit"
         return session
 
     def set_preferences(self, chat_id, model, reasoning_effort):
@@ -162,6 +169,17 @@ class Bridge:
             session["inherit_thread_settings"] = False
         self.save_state()
 
+    def set_fast_mode(self, chat_id, fast_mode):
+        session = self.session(chat_id)
+        thread_id = session["thread_id"]
+        if thread_id:
+            for item in self.state.values():
+                if item.get("thread_id") == thread_id:
+                    item["fast_mode"] = fast_mode
+        else:
+            session["fast_mode"] = fast_mode
+        self.save_state()
+
     def inherit_thread_settings(self, chat_id):
         session = self.session(chat_id)
         thread_id = session["thread_id"]
@@ -170,10 +188,12 @@ class Bridge:
                 if item.get("thread_id") == thread_id:
                     item["model"] = None
                     item["reasoning_effort"] = None
+                    item["fast_mode"] = "inherit"
                     item["inherit_thread_settings"] = True
         else:
             session["model"] = None
             session["reasoning_effort"] = None
+            session["fast_mode"] = "auto"
             session["inherit_thread_settings"] = False
         self.save_state()
 
@@ -187,6 +207,41 @@ class Bridge:
         if model_name:
             return next((item for item in models if item.model == model_name or item.id == model_name), None)
         return next((item for item in models if item.is_default), None)
+
+    def service_tiers(self, model):
+        tiers = model.service_tiers or []
+        fast = next((tier.id for tier in tiers if tier.id == "fast" or tier.name.lower() == "fast"), None)
+        standard = model.default_service_tier
+        if not standard or standard == fast:
+            standard = next((tier.id for tier in tiers if tier.id != fast), None)
+        return fast, standard
+
+    async def effective_service_tier(self, session):
+        fast_mode = session.get("fast_mode", "auto")
+        if fast_mode == "inherit":
+            return None
+        if fast_mode == "auto":
+            return "default"
+        models = await self.available_models()
+        current = self.selected_model(session, models)
+        if not current:
+            return "fast" if fast_mode == "on" else "default"
+        fast, standard = self.service_tiers(current)
+        if fast_mode == "on":
+            if not fast:
+                raise RuntimeError("当前模型不支持 Fast mode")
+            return fast
+        return standard or "default"
+
+    def fast_mode_text(self, session):
+        fast_mode = session.get("fast_mode", "auto")
+        if fast_mode == "on":
+            return "开启（飞书明确设置）"
+        if fast_mode == "off":
+            return "关闭（飞书明确设置）"
+        if fast_mode == "inherit":
+            return "沿用该 Codex session 的最新设置（具体开关无法读取）"
+        return "关闭（Codex 默认）" if session["thread_id"] else "未设置"
 
     def active_chat_for_thread(self, thread_id, exclude_chat_id=None):
         if not thread_id:
@@ -238,11 +293,13 @@ class Bridge:
     async def get_thread(self, chat_id, codex):
         session = self.session(chat_id)
         model = None if session.get("inherit_thread_settings") else session.get("model") or self.model
+        service_tier = await self.effective_service_tier(session)
         options = {
             "cwd": session["cwd"],
             "sandbox": Sandbox.full_access,
             "approval_mode": ApprovalMode.deny_all,
             "model": model,
+            "service_tier": service_tier,
         }
         if session["thread_id"]:
             thread = await codex.thread_resume(session["thread_id"], **options)
@@ -303,7 +360,7 @@ class Bridge:
             else:
                 model_name = session.get("model") or self.model or "Codex 默认（飞书未强制指定）"
                 reasoning_effort = session.get("reasoning_effort") or "模型默认"
-            await self.reply(message, f"当前会话状态：{status}\n其他正在执行的会话：{other_count}\n{details}\n当前目录：{session['cwd']}\n当前模型：{model_name}\nReasoning：{reasoning_effort}\n外部客户端占用：发送任务时检查")
+            await self.reply(message, f"当前会话状态：{status}\n其他正在执行的会话：{other_count}\n{details}\n当前目录：{session['cwd']}\n当前模型：{model_name}\nReasoning：{reasoning_effort}\nFast mode：{self.fast_mode_text(session)}\n外部客户端占用：发送任务时检查")
             return
         if text == "/stop":
             if message.chat_id not in self.active_turns:
@@ -376,6 +433,7 @@ class Bridge:
                     if item.get("thread_id") == thread_id:
                         item["thread_id"] = None
                         item["last_seen_turn_id"] = None
+                        item["fast_mode"] = "auto"
                         if item.get("inherit_thread_settings"):
                             item["inherit_thread_settings"] = False
                         bound_count += 1
@@ -439,7 +497,7 @@ class Bridge:
             await self.reply(message, session["cwd"])
             return
         if text == "/help":
-            await self.reply(message, "/pwd 查看当前目录\n/cd /绝对路径 切换目录\n/resume [1-20] 列出当前目录最近的 Codex session\n/resume --all [1-20] 列出全部目录最近的 Codex session\n/select 编号 进入指定 Codex session\n/new 开启新对话\n/rename 新名称 重命名当前 Codex session\n/model [编号|default] 查看或选择模型\n/reasoning [编号|档位|default] 查看或选择推理强度\n/delete [编号] 永久删除当前或列表中的 Codex session\n/group-create [临时群名] [绝对路径] 创建会话群\n/status 查看当前会话状态\n/stop 停止当前会话任务\n/recover-last 恢复上次中断任务\n/dismiss-last 放弃恢复上次任务")
+            await self.reply(message, "/pwd 查看当前目录\n/cd /绝对路径 切换目录\n/resume [1-20] 列出当前目录最近的 Codex session\n/resume --all [1-20] 列出全部目录最近的 Codex session\n/select 编号 进入指定 Codex session\n/new 开启新对话\n/rename 新名称 重命名当前 Codex session\n/model [编号|default] 查看或选择模型\n/reasoning [编号|档位|default] 查看或选择推理强度\n/fast [on|off] 查看或设置 Fast mode\n/delete [编号] 永久删除当前或列表中的 Codex session\n/group-create [临时群名] [绝对路径] 创建会话群\n/status 查看当前会话状态\n/stop 停止当前会话任务\n/recover-last 恢复上次中断任务\n/dismiss-last 放弃恢复上次任务")
             return
         if text == "/model" or text.startswith("/model "):
             parts = text.split()
@@ -543,6 +601,47 @@ class Bridge:
             shown_effort = selected_effort or f"{current.default_reasoning_effort.value}（模型默认）"
             await self.reply(message, f"已设置 Reasoning：{shown_effort}\n当前模型：{current.display_name}")
             return
+        if text == "/fast" or text.startswith("/fast "):
+            parts = text.split()
+            if len(parts) > 2 or (len(parts) == 2 and parts[1] not in {"on", "off"}):
+                await self.reply(message, "格式：/fast [on|off]")
+                return
+            if len(parts) == 1:
+                support = "当前模型由 Codex session 继承，精确支持状态无法读取"
+                try:
+                    models = await self.available_models()
+                    current = self.selected_model(session, models)
+                    if current:
+                        fast, _ = self.service_tiers(current)
+                        support = f"当前模型支持 Fast mode：{'是' if fast else '否'}"
+                except Exception as error:
+                    support = f"读取模型支持状态失败：{error}"
+                await self.reply(message, f"Fast mode：{self.fast_mode_text(session)}\n{support}\n\n开启：/fast on\n关闭：/fast off")
+                return
+            if message.chat_id in self.active_turns:
+                await self.reply(message, "当前会话正在执行任务，任务完成后才能切换 Fast mode。")
+                return
+            if self.active_chat_for_thread(session["thread_id"], message.chat_id):
+                await self.reply(message, "该 Codex session 正在另一个飞书会话中执行任务，任务完成后才能切换 Fast mode。")
+                return
+            fast_mode = parts[1]
+            if fast_mode == "on":
+                try:
+                    models = await self.available_models()
+                    current = self.selected_model(session, models)
+                except Exception as error:
+                    await self.reply(message, f"读取可用模型失败：{error}")
+                    return
+                if current and not self.service_tiers(current)[0]:
+                    await self.reply(message, "当前模型不支持 Fast mode，设置未修改。\n请使用 /model 查看或切换模型。")
+                    return
+            self.set_fast_mode(message.chat_id, fast_mode)
+            if fast_mode == "on":
+                response = "已开启 Fast mode。\n飞书下一条任务将使用 Fast 服务档位。"
+            else:
+                response = "已关闭 Fast mode。\n飞书下一条任务将使用普通服务档位。"
+            await self.reply(message, response)
+            return
         if text == "/rename" or text.startswith("/rename "):
             name = text[len("/rename"):].strip()
             if not name:
@@ -565,6 +664,7 @@ class Bridge:
                     response = f"重命名 Codex session 失败：{error}"
                 await self.reply(message, response)
                 return
+            self.resume_results.clear()
             action = "已创建并命名当前 Codex session" if created else "已将当前 Codex session 重命名"
             await self.reply(message, f"{action}：{name}")
             return
@@ -625,7 +725,7 @@ class Bridge:
                 rows.append(f"{index}. [{source_name}] {updated_at}｜{title}{cwd}｜{thread.id[:8]}")
             self.resume_results[message.chat_id] = threads
             heading = f"全部目录最近更新的 {len(rows)} 个 Codex session：" if all_directories else f"当前目录：{session['cwd']}\n最近更新的 {len(rows)} 个 Codex session："
-            await self.reply(message, heading + "\n\n" + "\n".join(rows) + "\n\n输入 /select 编号 进入指定 session，例如：/select 1")
+            await self.reply(message, heading + "\n\n" + "\n".join(rows) + "\n\n进入指定 session：/select 编号，例如 /select 1\n永久删除列表中的 session：/delete 编号，例如 /delete 2（仍需二次确认）")
             return
         if text == "/select" or text.startswith("/select "):
             if message.chat_id in self.active_turns:
@@ -714,6 +814,7 @@ class Bridge:
                 "last_seen_turn_id": last_seen_turn_id,
                 "model": session.get("model"),
                 "reasoning_effort": session.get("reasoning_effort"),
+                "fast_mode": session.get("fast_mode", "auto"),
                 "inherit_thread_settings": session.get("inherit_thread_settings"),
             }
             self.save_state()
@@ -735,6 +836,7 @@ class Bridge:
             session["cwd"] = str(cwd)
             session["thread_id"] = None
             session["last_seen_turn_id"] = None
+            session["fast_mode"] = "auto"
             if session.get("inherit_thread_settings"):
                 session["model"] = None
                 session["reasoning_effort"] = None
@@ -747,6 +849,7 @@ class Bridge:
         if text == "/new":
             session["thread_id"] = None
             session["last_seen_turn_id"] = None
+            session["fast_mode"] = "auto"
             if session.get("inherit_thread_settings"):
                 session["model"] = None
                 session["reasoning_effort"] = None
@@ -771,6 +874,8 @@ class Bridge:
                     if external_update:
                         self.inherit_thread_settings(message.chat_id)
                 thread = await self.get_thread(message.chat_id, codex)
+                self.resume_results.clear()
+                service_tier = await self.effective_service_tier(session)
                 notice = "检测到该 Codex session 在本飞书会话上次操作后有新的对话内容，可能来自 Workspace、CLI 或另一个飞书会话。\n本次任务将基于最新上下文继续。\n\n" if external_update else ""
                 await self.reply(message, f"{notice}Codex 正在处理……\n当前目录：{session['cwd']}")
                 task = {
@@ -782,6 +887,7 @@ class Bridge:
                     "prompt": task_prompt,
                     "model": None if session.get("inherit_thread_settings") else session.get("model") or self.model,
                     "reasoning_effort": None if session.get("inherit_thread_settings") else session.get("reasoning_effort"),
+                    "service_tier": service_tier,
                     "started_at": int(time.time()),
                     "delivered": False,
                 }
@@ -789,7 +895,7 @@ class Bridge:
                 self.save_last_tasks()
                 model = None if session.get("inherit_thread_settings") else session.get("model") or self.model
                 effort = ReasoningEffort(session["reasoning_effort"]) if not session.get("inherit_thread_settings") and session.get("reasoning_effort") else None
-                turn = await thread.turn(text, model=model, effort=effort)
+                turn = await thread.turn(text, model=model, effort=effort, service_tier=service_tier)
                 self.active_turns[message.chat_id] = turn
                 session["last_seen_turn_id"] = turn.id
                 self.save_state()
