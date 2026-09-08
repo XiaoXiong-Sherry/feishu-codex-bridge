@@ -142,7 +142,6 @@ class Bridge:
             for task in pending:
                 await self.deliver_pending_result(task, "飞书连接已恢复。任务已经结束，但原回复可能没有送达，现补发结果：")
             return
-        await self.notify_user("飞书连接已恢复，当前没有需要恢复的任务。")
 
     def session(self, chat_id):
         session = self.state.setdefault(chat_id, {"cwd": self.initial_cwd, "thread_id": None, "last_seen_turn_id": None})
