@@ -12,6 +12,7 @@ if cert_file.is_file():
 from lark_channel import ChatQueueConfig, FeishuChannel, LogLevel, PolicyConfig, SafetyConfig
 from lark_channel.api.im.v1.model.create_chat_request import CreateChatRequest
 from lark_channel.api.im.v1.model.create_chat_request_body import CreateChatRequestBody
+from codex_cli_bin import bundled_codex_path
 from openai_codex import ApprovalMode, AsyncCodex, AsyncThread, Sandbox
 from openai_codex.generated.v2_all import AgentMessageThreadItem, ConfigReadResponse, ItemCompletedNotification, MessagePhase, ThreadSortKey, ThreadSourceKind, TurnCompletedNotification
 from openai_codex.types import ReasoningEffort
@@ -435,7 +436,7 @@ class Bridge:
                     await self.reply(message, "该 Codex session 有等待处理的中断任务。请先在对应飞书会话使用 /recover-last 或 /dismiss-last。")
                     return
                 process = await asyncio.create_subprocess_exec(
-                    "codex",
+                    str(bundled_codex_path()),
                     "delete",
                     "--force",
                     thread_id,

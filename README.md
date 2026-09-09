@@ -2,6 +2,8 @@
 
 通过飞书远程使用当前机器或 Workspace 中已经登录的 Codex。Bridge 会创建或恢复 Codex session，在指定目录中查看代码、运行命令和修改文件；它不是在远程操作 Workspace 的图形界面。
 
+支持 Intel/AMD 和 ARM 架构的 Linux，以及 Intel 和 Apple Silicon Mac。
+
 本文面向第一次接触飞书开放平台、终端和 Codex 的用户。先完成“快速开始”，需要时再查看命令说明、运行规则和故障排查。
 
 ## 1. 功能速览
@@ -49,6 +51,8 @@ codex
 
 能够正常进入后退出。Bridge 会复用当前账号已有的 Codex 登录状态和配置。
 
+Bridge 与同一系统用户的本地 Codex CLI 共用 `~/.codex` 中的登录、配置和 session；不同电脑或不同系统用户的数据彼此独立。Bridge 默认使用 Python SDK 配套的 Codex runtime，避免本地 CLI 与 SDK 版本不一致。
+
 确认 Pixi 已安装：
 
 ```bash
@@ -66,17 +70,16 @@ pixi --version
 
 | 用途 | 权限代码 |
 |---|---|
+| 获取与发送单聊、群组消息 | `im:message` |
 | 接收用户发给机器人的私聊消息 | `im:message.p2p_msg:readonly` |
 | 接收群聊中 `@机器人` 的消息 | `im:message.group_at_msg:readonly` |
 | 接收群聊中用户和机器人发送的普通消息 | `im:message.group_msg.include_bot:read` |
 | 让机器人以应用身份回复消息 | `im:message:send_as_bot` |
 | 让机器人创建会话群 | `im:chat:create` |
 
-5. 在“事件与回调”中选择“使用长连接接收事件”。
-6. 添加消息事件 `im.message.receive_v1`。
-7. 设置应用可用范围。第一次建议只加入自己。
-8. 在“版本管理与发布”中创建版本并发布；如需管理员审核，等待审核通过。
-9. 在“凭证与基础信息”中找到 `App ID` 和 `App Secret`。
+5. 在“事件与回调”中选择“使用长连接接收事件”，并添加消息事件 `im.message.receive_v1`。
+6. 在“版本管理与发布”中设置应用可用范围，第一次建议只加入自己，然后创建版本并发布；如需管理员审核，等待审核通过。
+7. 在“凭证与基础信息”中找到 `App ID` 和 `App Secret`。
 
 修改权限、事件或可用范围后，通常需要重新创建版本并发布。不要把 App Secret 提交到 Git 或发送到聊天中。
 
@@ -84,7 +87,7 @@ pixi --version
 
 ```bash
 cd ~/feishu-codex-bridge
-pixi install
+pixi install --locked
 ```
 
 ### 2.4 创建私有凭证文件
@@ -458,7 +461,7 @@ pixi run stop
 
 修改代码或配置后，依次执行 `pixi run stop`、`pixi run start` 和 `pixi run status`。
 
-Bridge 使用 `nohup + setsid` 后台运行，关闭终端不会停止。Workspace、容器或服务器重启后需要手动启动。进程存在不代表飞书长连接一定健康，还应检查飞书上线通知和错误日志。
+Bridge 使用 `nohup` 和 Python 独立进程组后台运行，关闭终端不会停止。Mac、Workspace、容器或服务器重启后需要手动启动。进程存在不代表飞书长连接一定健康，还应检查飞书上线通知和错误日志。
 
 ### 5.2 配置和运行文件
 
@@ -479,7 +482,6 @@ Bridge 使用 `nohup + setsid` 后台运行，关闭终端不会停止。Workspa
 
 ```bash
 chmod 600 ~/.config/codex-feishu/env
-stat -c '%a %n' ~/.config/codex-feishu/env
 ```
 
 ### 5.3 安全措施
@@ -508,7 +510,7 @@ stat -c '%a %n' ~/.config/codex-feishu/env
 
 依次确认：
 
-1. 飞书应用已经发布，机器人能力、五项权限和 `im.message.receive_v1` 已配置。
+1. 飞书应用已经发布，机器人能力、六项权限和 `im.message.receive_v1` 已配置。
 2. 事件订阅使用长连接，自己位于应用可用范围内。
 3. `FEISHU_ALLOWED_OPEN_ID` 与自己的 Open ID 完全一致。
 4. `pixi run status` 显示 Bridge 正在运行。
@@ -572,7 +574,7 @@ pixi run status
 
 ## 8. 快速验收
 
-- [ ] 飞书应用已发布，机器人、五项权限和消息事件已配置。
+- [ ] 飞书应用已发布，机器人、六项权限和消息事件已配置。
 - [ ] 私有凭证文件权限为 `600`，Open ID 已填写。
 - [ ] `pixi run status` 显示 Bridge 正在运行且日志没有错误。
 - [ ] 飞书发送 `/status` 和 `/pwd` 能收到回复。
