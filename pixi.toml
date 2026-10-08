@@ -1,12 +1,12 @@
 [workspace]
 channels = ["conda-forge"]
-platforms = ["linux-64"]
+platforms = ["linux-64", "osx-arm64"]
 
 [dependencies]
 python = ">=3.10"
 
 [pypi-dependencies]
-lark-channel-sdk = "*"
+lark-channel-sdk = "==1.4.0"
 openai-codex = "*"
 socksio = "*"
 
@@ -14,3 +14,4 @@ socksio = "*"
 start = "bash start.sh start"
 stop = "bash start.sh stop"
 status = "bash start.sh status"
+test = "python -m unittest discover -s tests -v"

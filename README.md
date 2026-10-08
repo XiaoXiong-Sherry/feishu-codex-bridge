@@ -103,11 +103,15 @@ FEISHU_APP_SECRET=你的_App_Secret
 FEISHU_ALLOWED_OPEN_ID=
 CODEX_INITIAL_CWD=
 CODEX_MODEL=
+CODEX_REQUEST_TIMEOUT_SECONDS=45
+CODEX_TURN_IDLE_TIMEOUT_SECONDS=900
+CODEX_RECONNECT_CLEANUP_TIMEOUT_SECONDS=8
 ```
 
 - `FEISHU_ALLOWED_OPEN_ID` 第一次保持为空，下一步获取。
 - `CODEX_INITIAL_CWD` 留空时使用当前用户主目录，也可以填写其他绝对路径。
 - `CODEX_MODEL` 留空时不强制指定模型。
+- 三个超时配置分别限制 Codex 请求等待、任务连续无事件时间和重连清理时间；通常保持默认值即可。
 - 等号两边不要添加空格。
 
 ### 2.5 第一次启动并获取 Open ID
@@ -373,10 +377,11 @@ Codex 主动发送阶段性说明时，Bridge 会转发为“Codex 进度”；�
 
 ### 3.7 Bridge 重启后的任务恢复
 
-Bridge 启动和飞书重连后会私聊允许使用者：
+Bridge 启动后会私聊允许使用者；飞书重连后只在有任务需要处理时通知：
 
 - 上次任务已结束但结果未送达：补发保存的结果，不重新执行。
-- 重启时任务仍在运行：报告“可能中断”，不会自动重复执行。
+- 切换网络时任务仍在运行：将任务标记为中断，关闭旧 app-server，并在清理完成后恢复消息处理；不会自动重复执行。
+- Bridge 重启时任务仍在运行：报告“可能中断”，不会自动重复执行。
 
 回到原飞书私聊或群聊处理：
 
@@ -433,7 +438,7 @@ Codex 保持当前 turn、持续检查进程并主动汇报时，Bridge 会将�
 启动任务后保持当前任务运行，定期检查并汇报进度，直到任务结束。
 ```
 
-Bridge 没有固定任务超时，合法的长任务可以持续运行数小时。
+Bridge 不限制任务总时长。任务连续 15 分钟没有任何 app-server 事件时会被判定为失去响应并中断；可通过 `CODEX_TURN_IDLE_TIMEOUT_SECONDS` 调整。
 
 ## 5. 运行、安全与数据
 

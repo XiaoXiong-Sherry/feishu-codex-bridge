@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import time
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -17,9 +18,32 @@ from openai_codex.generated.v2_all import AgentMessageThreadItem, ItemCompletedN
 from openai_codex.types import ReasoningEffort
 
 
+def positive_timeout(name, default):
+    value = float(os.getenv(name, default))
+    if value <= 0:
+        raise ValueError(f"{name} 必须大于 0")
+    return value
+
+
+@dataclass
+class ActiveTurn:
+    task: asyncio.Task
+    chat_id: str
+    client: object = None
+    turn: object = None
+    invalidated: bool = False
+    terminal: bool = False
+    client_closed: bool = False
+    close_task: asyncio.Task = None
+    stream_task: asyncio.Task = None
+
+
+class ExecutionStateUnknown(RuntimeError):
+    pass
+
+
 class Bridge:
-    def __init__(self, codex, channel):
-        self.codex = codex
+    def __init__(self, channel):
         self.channel = channel
         self.allowed_open_id = os.getenv("FEISHU_ALLOWED_OPEN_ID", "").strip()
         self.initial_cwd = str(Path(os.getenv("CODEX_INITIAL_CWD") or Path.home()).expanduser().resolve())
@@ -42,7 +66,12 @@ class Bridge:
         self.model_results = {}
         self.pending_deletes = {}
         self.active_turns = {}
-        self.loop = asyncio.get_running_loop()
+        self.codex_request_timeout = positive_timeout("CODEX_REQUEST_TIMEOUT_SECONDS", 45)
+        self.turn_idle_timeout = positive_timeout("CODEX_TURN_IDLE_TIMEOUT_SECONDS", 900)
+        self.reconnect_cleanup_timeout = positive_timeout("CODEX_RECONNECT_CLEANUP_TIMEOUT_SECONDS", 8)
+        self.reconnect_cleanup_future = None
+        self.reconnect_generation = 0
+        self.reconnecting = False
         interrupted = False
         for task in self.last_tasks.values():
             if task.get("status") == "running":
@@ -130,19 +159,172 @@ class Bridge:
         if not pending:
             await self.notify_user("Codex Bridge 已上线，飞书连接正常。")
 
-    def on_reconnected(self):
-        self.loop.call_soon_threadsafe(self.loop.create_task, self.notify_reconnected())
+    def on_reconnecting(self):
+        self.reconnect_generation += 1
+        self.reconnecting = True
+        self.reconnect_cleanup_future = self.channel.schedule(self.invalidate_active_turns())
 
-    async def notify_reconnected(self):
-        if self.active_turns:
-            await self.notify_user(f"飞书连接已恢复。当前有 {len(self.active_turns)} 个 Codex 任务仍在运行，没有重复执行任务。")
+    def on_reconnected(self):
+        generation = self.reconnect_generation
+        cleanup_future = self.reconnect_cleanup_future
+        self.channel.schedule(self.notify_reconnected(generation, cleanup_future))
+
+    async def control_call(self, operation):
+        client = AsyncCodex()
+        try:
+            await asyncio.wait_for(
+                client.__aenter__(), timeout=self.codex_request_timeout
+            )
+            return await asyncio.wait_for(
+                operation(client), timeout=self.codex_request_timeout
+            )
+        finally:
+            close_task = asyncio.create_task(client.close())
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(close_task), timeout=self.reconnect_cleanup_timeout
+                )
+            except Exception as error:
+                print(f"关闭只读 Codex app-server 失败：{error}", flush=True)
+
+    def release_finished_active_turn(self, chat_id, state):
+        stream_stopped = state.stream_task is None or state.stream_task.done()
+        if state.task.done() and state.client_closed and stream_stopped:
+            if self.active_turns.get(chat_id) is state:
+                self.active_turns.pop(chat_id, None)
+
+    async def close_codex_client(self, state):
+        if state.close_task is None:
+            state.close_task = asyncio.create_task(state.client.close())
+
+            def close_finished(task):
+                if not task.cancelled() and task.exception() is None:
+                    state.client_closed = True
+                self.release_finished_active_turn(state.chat_id, state)
+
+            state.close_task.add_done_callback(close_finished)
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(state.close_task), timeout=self.reconnect_cleanup_timeout
+            )
+            state.client_closed = True
+            return True
+        except asyncio.TimeoutError:
+            print("关闭 Codex app-server 超时，继续隔离旧任务", flush=True)
+            return False
+        except Exception as error:
+            print(f"关闭 Codex app-server 失败：{error}", flush=True)
+            return False
+
+    async def invalidate_active_turn(self, chat_id, state, reason="feishu_reconnected"):
+        if state.terminal:
+            closed = await self.close_codex_client(state)
+            if state.task is not asyncio.current_task() and not state.task.done():
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(state.task), timeout=self.reconnect_cleanup_timeout
+                    )
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    pass
+                except Exception:
+                    pass
+            if closed and state.task.done() and self.active_turns.get(chat_id) is state:
+                self.active_turns.pop(chat_id, None)
             return
-        pending = [task for task in self.last_tasks.values() if not task.get("delivered") and task.get("status") in {"completed", "failed", "stopped"}]
-        if pending:
-            for task in pending:
-                await self.deliver_pending_result(task, "飞书连接已恢复。任务已经结束，但原回复可能没有送达，现补发结果：")
+
+        state.invalidated = True
+        task = self.last_tasks.get(chat_id)
+        if task and task.get("status") == "running":
+            task["status"] = "interrupted"
+            task["interrupted_reason"] = reason
+            task["finished_at"] = int(time.time())
+
+        if state.turn is not None:
+            try:
+                await asyncio.wait_for(
+                    state.turn.interrupt(), timeout=min(3.0, self.reconnect_cleanup_timeout)
+                )
+            except Exception as error:
+                print(f"停止断线期间的 Codex 任务失败，将关闭 app-server：{error}", flush=True)
+
+        closed = await self.close_codex_client(state)
+        if state.task is not asyncio.current_task() and not state.task.done():
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(state.task), timeout=self.reconnect_cleanup_timeout
+                )
+            except asyncio.TimeoutError:
+                state.task.cancel()
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(state.task), timeout=self.reconnect_cleanup_timeout
+                    )
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    pass
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+        closed = closed or await self.close_codex_client(state)
+        if closed and state.task.done() and self.active_turns.get(chat_id) is state:
+            self.active_turns.pop(chat_id, None)
+
+    async def invalidate_active_turns(self):
+        active = list(self.active_turns.items())
+        await asyncio.gather(
+            *(self.invalidate_active_turn(chat_id, state) for chat_id, state in active)
+        )
+        if active:
+            self.save_last_tasks()
+        return [chat_id for chat_id, _ in active]
+
+    async def wait_for_reconnect_cleanup(self, future=None):
+        future = future or self.reconnect_cleanup_future
+        if future is None:
             return
-        await self.notify_user("飞书连接已恢复，当前没有需要恢复的任务。")
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(asyncio.wrap_future(future)),
+                timeout=self.reconnect_cleanup_timeout * 3 + 1,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            print(f"等待断线任务清理失败：{error}", flush=True)
+
+    async def wait_until_reconnected(self):
+        while self.reconnecting:
+            await asyncio.sleep(0.1)
+        await self.wait_for_reconnect_cleanup()
+
+    async def notify_reconnected(self, generation=None, cleanup_future=None):
+        generation = self.reconnect_generation if generation is None else generation
+        try:
+            await self.wait_for_reconnect_cleanup(cleanup_future)
+            pending = [task for task in self.last_tasks.values() if not task.get("delivered") and task.get("status") in {"completed", "failed", "stopped"}]
+            if pending:
+                for task in pending:
+                    await self.deliver_pending_result(task, "飞书连接已恢复。任务已经结束，但原回复可能没有送达，现补发结果：")
+            interrupted = [
+                task
+                for task in self.last_tasks.values()
+                if task.get("status") == "interrupted"
+                and task.get("interrupted_reason") == "feishu_reconnected"
+                and not task.get("reconnect_notice_delivered")
+            ]
+            if interrupted:
+                delivered = await self.notify_user(
+                    f"飞书连接已恢复。断线期间的 {len(interrupted)} 个 Codex 任务已标记为中断，"
+                    "对应 app-server 已关闭，没有自动重复执行任务。请直接发送新消息继续，"
+                    "或发送 /recover-last 检查现场后恢复上一个任务。"
+                )
+                if delivered:
+                    for task in interrupted:
+                        task["reconnect_notice_delivered"] = True
+                    self.save_last_tasks()
+        finally:
+            if generation == self.reconnect_generation:
+                self.reconnecting = False
 
     def session(self, chat_id):
         session = self.state.setdefault(chat_id, {"cwd": self.initial_cwd, "thread_id": None, "last_seen_turn_id": None})
@@ -198,7 +380,8 @@ class Bridge:
         self.save_state()
 
     async def available_models(self):
-        return (await self.codex.models()).data
+        result = await self.control_call(lambda codex: codex.models())
+        return result.data
 
     def selected_model(self, session, models):
         if session.get("inherit_thread_settings"):
@@ -262,26 +445,58 @@ class Bridge:
             {"reply_to": message.message_id},
         )
 
-    async def run_turn(self, message, turn):
+    async def run_turn(self, message, turn, state):
         completed_turn = None
         final_response = None
         fallback_response = None
-        async for event in turn.stream():
-            payload = event.payload
-            if isinstance(payload, ItemCompletedNotification) and payload.turn_id == turn.id:
-                item = payload.item.root if hasattr(payload.item, "root") else payload.item
-                if isinstance(item, AgentMessageThreadItem):
-                    if item.phase == MessagePhase.commentary and item.text.strip():
-                        try:
-                            await self.reply(message, f"Codex 进度：\n{item.text}")
-                        except Exception as error:
-                            print(f"Codex 进度发送失败：{error}", flush=True)
-                    elif item.phase == MessagePhase.final_answer:
-                        final_response = item.text
-                    elif item.phase is None:
-                        fallback_response = item.text
-            elif isinstance(payload, TurnCompletedNotification) and payload.turn.id == turn.id:
-                completed_turn = payload.turn
+        stream = turn.stream()
+        try:
+            while True:
+                state.stream_task = asyncio.create_task(anext(stream))
+                state.stream_task.add_done_callback(
+                    lambda _task: self.release_finished_active_turn(state.chat_id, state)
+                )
+                done, _ = await asyncio.wait(
+                    {state.stream_task}, timeout=self.turn_idle_timeout
+                )
+                if not done:
+                    await self.close_codex_client(state)
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.shield(state.stream_task),
+                            timeout=self.reconnect_cleanup_timeout,
+                        )
+                    except BaseException:
+                        pass
+                    raise ExecutionStateUnknown(
+                        f"Codex app-server 连续 {self.turn_idle_timeout:g} 秒没有返回事件，任务状态未知"
+                    )
+                try:
+                    event = await state.stream_task
+                except StopAsyncIteration:
+                    break
+                finally:
+                    state.stream_task = None
+                payload = event.payload
+                if isinstance(payload, ItemCompletedNotification) and payload.turn_id == turn.id:
+                    item = payload.item.root if hasattr(payload.item, "root") else payload.item
+                    if isinstance(item, AgentMessageThreadItem):
+                        if item.phase == MessagePhase.commentary and item.text.strip():
+                            try:
+                                await self.reply(message, f"Codex 进度：\n{item.text}")
+                            except Exception as error:
+                                print(f"Codex 进度发送失败：{error}", flush=True)
+                        elif item.phase == MessagePhase.final_answer:
+                            final_response = item.text
+                        elif item.phase is None:
+                            fallback_response = item.text
+                elif isinstance(payload, TurnCompletedNotification) and payload.turn.id == turn.id:
+                    completed_turn = payload.turn
+                    state.terminal = True
+                    break
+        finally:
+            if state.stream_task is None or state.stream_task.done():
+                await stream.aclose()
         if completed_turn is None:
             raise RuntimeError("turn completed event not received")
         if completed_turn.status.value == "failed":
@@ -325,6 +540,12 @@ class Bridge:
             return
         if message.id in self.seen_ids:
             return
+        if self.reconnecting or (
+            self.reconnect_cleanup_future and not self.reconnect_cleanup_future.done()
+        ):
+            await self.wait_until_reconnected()
+        if message.id in self.seen_ids:
+            return
         self.mark_seen(message.id)
         text = (message.body_text or message.content_text).strip()
         delete_confirmation = text.split()
@@ -345,7 +566,10 @@ class Bridge:
                 source = "飞书 Codex" if session["thread_id"] in self.feishu_thread_ids else "本地 Codex"
                 thread_lines = ["Codex session：已绑定", "Session 名称：读取失败", f"Session 来源：{source}", f"Session ID：{session['thread_id']}"]
                 try:
-                    thread_data = (await AsyncThread(self.codex, session["thread_id"]).read()).thread
+                    result = await self.control_call(
+                        lambda codex: AsyncThread(codex, session["thread_id"]).read()
+                    )
+                    thread_data = result.thread
                     name = thread_data.name or "未命名"
                     thread_lines[1] = f"Session 名称：{name}"
                     if not thread_data.name and thread_data.preview:
@@ -366,7 +590,8 @@ class Bridge:
             if message.chat_id not in self.active_turns:
                 await self.reply(message, "当前会话没有正在执行的任务。")
                 return
-            turn = self.active_turns[message.chat_id]
+            state = self.active_turns[message.chat_id]
+            turn = state.turn
             if turn is None:
                 await self.reply(message, "当前任务正在启动，请稍后重新发送 /stop。")
                 return
@@ -374,7 +599,21 @@ class Bridge:
             if task:
                 task["stop_requested"] = True
                 self.save_last_tasks()
-            await turn.interrupt()
+            try:
+                await asyncio.wait_for(
+                    turn.interrupt(), timeout=self.codex_request_timeout
+                )
+            except Exception as error:
+                await self.invalidate_active_turn(
+                    message.chat_id, state, reason="interrupt_failed"
+                )
+                self.save_last_tasks()
+                await self.reply(
+                    message,
+                    f"停止请求失败，旧任务已标记为中断并关闭 app-server：{error}。"
+                    "任务不会自动重新执行。",
+                )
+                return
             await self.reply(message, "已请求停止当前会话的 Codex 任务。")
             return
         if text == "/delete" or text.startswith("/delete "):
@@ -460,7 +699,10 @@ class Bridge:
                 await self.reply(message, "该 Codex session 有等待处理的中断任务。请先在对应飞书会话使用 /recover-last 或 /dismiss-last。")
                 return
             try:
-                thread_data = (await AsyncThread(self.codex, thread_id).read()).thread
+                result = await self.control_call(
+                    lambda codex: AsyncThread(codex, thread_id).read()
+                )
+                thread_data = result.thread
             except Exception as error:
                 await self.reply(message, f"读取待删除 Codex session 失败：{error}")
                 return
@@ -655,9 +897,11 @@ class Bridge:
                 return
             created = not session["thread_id"]
             try:
-                async with AsyncCodex() as codex:
+                async def rename_thread(codex):
                     thread = await self.get_thread(message.chat_id, codex)
                     await thread.set_name(name)
+
+                await self.control_call(rename_thread)
             except Exception as error:
                 response = self.execution_error(error)
                 if not response.startswith("该 Codex session"):
@@ -693,20 +937,24 @@ class Bridge:
                 )
                 if not all_directories:
                     options["cwd"] = session["cwd"]
-                threads = []
-                thread_ids = set()
-                cursor = None
-                while len(threads) < limit:
-                    if cursor:
-                        options["cursor"] = cursor
-                    result = await self.codex.thread_list(**options)
-                    for thread in result.data:
-                        if thread.id not in thread_ids:
-                            thread_ids.add(thread.id)
-                            threads.append(thread)
-                    cursor = result.next_cursor
-                    if not cursor:
-                        break
+                async def load_threads(codex):
+                    threads = []
+                    thread_ids = set()
+                    cursor = None
+                    while len(threads) < limit:
+                        if cursor:
+                            options["cursor"] = cursor
+                        result = await codex.thread_list(**options)
+                        for thread in result.data:
+                            if thread.id not in thread_ids:
+                                thread_ids.add(thread.id)
+                                threads.append(thread)
+                        cursor = result.next_cursor
+                        if not cursor:
+                            break
+                    return threads
+
+                threads = await self.control_call(load_threads)
                 threads.sort(key=lambda thread: thread.updated_at, reverse=True)
                 threads = threads[:limit]
             except Exception as error:
@@ -745,8 +993,12 @@ class Bridge:
                 return
             thread = threads[index - 1]
             try:
-                async with AsyncCodex() as codex:
-                    thread_data = (await AsyncThread(codex, thread.id).read(include_turns=True)).thread
+                result = await self.control_call(
+                    lambda codex: AsyncThread(codex, thread.id).read(
+                        include_turns=True
+                    )
+                )
+                thread_data = result.thread
             except Exception as error:
                 await self.reply(message, f"读取 Codex session 失败：{error}")
                 return
@@ -786,8 +1038,12 @@ class Bridge:
             last_seen_turn_id = None
             if session["thread_id"]:
                 try:
-                    async with AsyncCodex() as codex:
-                        thread_data = (await AsyncThread(codex, session["thread_id"]).read(include_turns=True)).thread
+                    result = await self.control_call(
+                        lambda codex: AsyncThread(codex, session["thread_id"]).read(
+                            include_turns=True
+                        )
+                    )
+                    thread_data = result.thread
                     formal_name = thread_data.name or ""
                     last_seen_turn_id = thread_data.turns[-1].id if thread_data.turns else None
                 except Exception as error:
@@ -862,67 +1118,113 @@ class Bridge:
         if self.active_chat_for_thread(session["thread_id"], message.chat_id):
             await self.reply(message, "该 Codex session 正在另一个飞书会话中执行任务，请等待任务完成后再试。")
             return
-        self.active_turns[message.chat_id] = None
+        task = {
+            "status": "running",
+            "chat_id": message.chat_id,
+            "chat_type": message.chat_type,
+            "thread_id": session["thread_id"],
+            "cwd": session["cwd"],
+            "prompt": task_prompt,
+            "model": None if session.get("inherit_thread_settings") else session.get("model") or self.model,
+            "reasoning_effort": None if session.get("inherit_thread_settings") else session.get("reasoning_effort"),
+            "service_tier": None,
+            "started_at": int(time.time()),
+            "delivered": False,
+        }
+        self.last_tasks[message.chat_id] = task
+        self.save_last_tasks()
+        owner_task = asyncio.current_task()
+        state = ActiveTurn(task=owner_task, chat_id=message.chat_id)
+        owner_task.add_done_callback(
+            lambda _task: self.release_finished_active_turn(message.chat_id, state)
+        )
+        self.active_turns[message.chat_id] = state
         try:
-            async with AsyncCodex() as codex:
+            codex = AsyncCodex()
+            state.client = codex
+            try:
+                await asyncio.wait_for(
+                    codex.__aenter__(), timeout=self.codex_request_timeout
+                )
                 external_update = False
                 if session["thread_id"]:
-                    thread_data = (await AsyncThread(codex, session["thread_id"]).read(include_turns=True)).thread
+                    thread_data = (
+                        await asyncio.wait_for(
+                            AsyncThread(codex, session["thread_id"]).read(include_turns=True),
+                            timeout=self.codex_request_timeout,
+                        )
+                    ).thread
                     latest_turn_id = thread_data.turns[-1].id if thread_data.turns else None
                     last_seen_turn_id = session.get("last_seen_turn_id")
                     external_update = last_seen_turn_id is not None and latest_turn_id != last_seen_turn_id
                     if external_update:
                         self.inherit_thread_settings(message.chat_id)
-                thread = await self.get_thread(message.chat_id, codex)
+                thread = await asyncio.wait_for(
+                    self.get_thread(message.chat_id, codex),
+                    timeout=self.codex_request_timeout,
+                )
                 self.resume_results.clear()
                 service_tier = await self.effective_service_tier(session)
+                task["thread_id"] = thread.id
+                task["service_tier"] = service_tier
+                self.save_last_tasks()
                 notice = "检测到该 Codex session 在本飞书会话上次操作后有新的对话内容，可能来自 Workspace、CLI 或另一个飞书会话。\n本次任务将基于最新上下文继续。\n\n" if external_update else ""
                 await self.reply(message, f"{notice}Codex 正在处理……\n当前目录：{session['cwd']}")
-                task = {
-                    "status": "running",
-                    "chat_id": message.chat_id,
-                    "chat_type": message.chat_type,
-                    "thread_id": thread.id,
-                    "cwd": session["cwd"],
-                    "prompt": task_prompt,
-                    "model": None if session.get("inherit_thread_settings") else session.get("model") or self.model,
-                    "reasoning_effort": None if session.get("inherit_thread_settings") else session.get("reasoning_effort"),
-                    "service_tier": service_tier,
-                    "started_at": int(time.time()),
-                    "delivered": False,
-                }
-                self.last_tasks[message.chat_id] = task
-                self.save_last_tasks()
                 model = None if session.get("inherit_thread_settings") else session.get("model") or self.model
                 effort = ReasoningEffort(session["reasoning_effort"]) if not session.get("inherit_thread_settings") and session.get("reasoning_effort") else None
-                turn = await thread.turn(text, model=model, effort=effort, service_tier=service_tier)
-                self.active_turns[message.chat_id] = turn
+                try:
+                    turn = await asyncio.wait_for(
+                        thread.turn(text, model=model, effort=effort, service_tier=service_tier),
+                        timeout=self.codex_request_timeout,
+                    )
+                except asyncio.TimeoutError as error:
+                    raise ExecutionStateUnknown(
+                        "Codex app-server 启动任务后没有及时确认，任务状态未知"
+                    ) from error
+                state.turn = turn
                 session["last_seen_turn_id"] = turn.id
                 self.save_state()
-                result_status, final_response = await self.run_turn(message, turn)
-            if result_status.value == "interrupted":
-                response = "已确认停止当前会话的 Codex 任务。当前 session 和上下文仍会保留。" if task.get("stop_requested") else "Codex 任务已中断。当前 session 和上下文仍会保留。"
-                task["status"] = "stopped"
+                result_status, final_response = await self.run_turn(message, turn, state)
+                if state.invalidated:
+                    return
+                state.terminal = True
+                if result_status.value == "interrupted":
+                    response = "已确认停止当前会话的 Codex 任务。当前 session 和上下文仍会保留。" if task.get("stop_requested") else "Codex 任务已中断。当前 session 和上下文仍会保留。"
+                    task["status"] = "stopped"
+                else:
+                    response = final_response or f"Codex 未返回文本结果，状态：{result_status}"
+                    task["status"] = "completed" if result_status.value == "completed" else "failed"
                 task["result"] = response
                 task["finished_at"] = int(time.time())
                 self.save_last_tasks()
-                delivery = await self.reply(message, response)
-                if delivery.success:
-                    task["delivered"] = True
-                    self.save_last_tasks()
-            else:
-                response = final_response or f"Codex 未返回文本结果，状态：{result_status}"
-                task["status"] = "completed" if result_status.value == "completed" else "failed"
-                task["result"] = response
-                task["finished_at"] = int(time.time())
+            finally:
+                await self.close_codex_client(state)
+            delivery = await self.reply(message, response)
+            if delivery.success:
+                task["delivered"] = True
                 self.save_last_tasks()
-                delivery = await self.reply(message, response)
-                if delivery.success:
-                    task["delivered"] = True
-                    self.save_last_tasks()
+        except asyncio.CancelledError:
+            if not state.invalidated:
+                raise
+        except ExecutionStateUnknown as error:
+            state.invalidated = True
+            task["status"] = "interrupted"
+            task["interrupted_reason"] = "codex_state_unknown"
+            task["result"] = (
+                f"{error}。为避免重复执行，Bridge 没有自动重试。"
+                "请发送 /recover-last 检查现场后继续。"
+            )
+            task["finished_at"] = int(time.time())
+            self.save_last_tasks()
+            delivery = await self.reply(message, task["result"])
+            if delivery.success:
+                task["delivered"] = True
+                self.save_last_tasks()
         except Exception as error:
-            response = self.execution_error(error)
             task = self.last_tasks.get(message.chat_id)
+            if state.invalidated:
+                return
+            response = self.execution_error(error)
             if task and task.get("status") == "running":
                 task["status"] = "failed"
                 task["result"] = response
@@ -933,7 +1235,12 @@ class Bridge:
                 task["delivered"] = True
                 self.save_last_tasks()
         finally:
-            self.active_turns.pop(message.chat_id, None)
+            stream_stopped = state.stream_task is None or state.stream_task.done()
+            if state.client_closed and stream_stopped:
+                if self.active_turns.get(message.chat_id) is state:
+                    self.active_turns.pop(message.chat_id, None)
+            else:
+                state.invalidated = True
 
 
 async def main():
@@ -948,13 +1255,13 @@ async def main():
     )
     channel = FeishuChannel(app_id=app_id, app_secret=app_secret, policy=policy, safety=SafetyConfig(chat_queue=ChatQueueConfig(enabled=False), stale_message_window_ms=30_000), log_level=LogLevel.WARNING)
     os.environ.pop("FEISHU_APP_SECRET", None)
-    async with AsyncCodex() as codex:
-        bridge = Bridge(codex, channel)
-        channel.on("message", bridge.on_message)
-        channel.on("reconnected", bridge.on_reconnected)
-        await channel.start_background()
-        await bridge.notify_started()
-        await asyncio.Event().wait()
+    bridge = Bridge(channel)
+    channel.on("message", bridge.on_message)
+    channel.on("reconnecting", bridge.on_reconnecting)
+    channel.on("reconnected", bridge.on_reconnected)
+    await channel.start_background()
+    await bridge.notify_started()
+    await asyncio.Event().wait()
 
 
 if __name__ == "__main__":
